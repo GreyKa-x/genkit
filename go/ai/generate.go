@@ -234,6 +234,7 @@ func GenerateWithRequest(ctx context.Context, r api.Registry, opts *GenerateActi
 	// registry so this Generate() call sees them while outer callers do not.
 	// Duplicate names across multiple middleware are rejected explicitly.
 	toolDefMap := make(map[string]*ToolDefinition)
+	toolDefs := make([]*ToolDefinition, 0, len(opts.Tools))
 	for _, t := range opts.Tools {
 		if _, ok := toolDefMap[t]; ok {
 			return nil, core.NewError(core.INVALID_ARGUMENT, "ai.GenerateWithRequest: duplicate tool %q", t)
@@ -244,7 +245,9 @@ func GenerateWithRequest(ctx context.Context, r api.Registry, opts *GenerateActi
 			return nil, core.NewError(core.NOT_FOUND, "ai.GenerateWithRequest: tool %q not found", t)
 		}
 
-		toolDefMap[t] = tool.Definition()
+		toolDef := tool.Definition()
+		toolDefMap[t] = toolDef
+		toolDefs = append(toolDefs, toolDef)
 	}
 	var middlewareTools []Tool
 	for _, mw := range mws {
@@ -255,7 +258,9 @@ func GenerateWithRequest(ctx context.Context, r api.Registry, opts *GenerateActi
 			if _, ok := toolDefMap[t.Name()]; ok {
 				return nil, core.NewError(core.INVALID_ARGUMENT, "ai.GenerateWithRequest: tool %q is contributed by middleware but already declared elsewhere", t.Name())
 			}
-			toolDefMap[t.Name()] = t.Definition()
+			toolDef := t.Definition()
+			toolDefMap[t.Name()] = toolDef
+			toolDefs = append(toolDefs, toolDef)
 			middlewareTools = append(middlewareTools, t)
 		}
 	}
@@ -267,11 +272,6 @@ func GenerateWithRequest(ctx context.Context, r api.Registry, opts *GenerateActi
 			t.Register(r)
 		}
 	}
-	toolDefs := make([]*ToolDefinition, 0, len(toolDefMap))
-	for _, t := range toolDefMap {
-		toolDefs = append(toolDefs, t)
-	}
-
 	maxTurns := opts.MaxTurns
 	if maxTurns < 0 {
 		return nil, core.NewError(core.INVALID_ARGUMENT, "ai.GenerateWithRequest: max turns must be greater than 0, got %d", maxTurns)

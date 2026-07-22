@@ -208,6 +208,43 @@ func TestStreamingChunksHaveRoleAndIndex(t *testing.T) {
 	}
 }
 
+func TestGeneratePreservesToolOrder(t *testing.T) {
+	ctx := context.Background()
+	reg := registry.New()
+	ConfigureFormats(reg)
+	DefineGenerateAction(ctx, reg)
+
+	var got []string
+	model := DefineModel(reg, "test/tool-order", &ModelOptions{Supports: &ModelSupports{Tools: true}}, func(_ context.Context, req *ModelRequest, _ ModelStreamCallback) (*ModelResponse, error) {
+		got = got[:0]
+		for _, tool := range req.Tools {
+			got = append(got, tool.Name)
+		}
+		return &ModelResponse{Request: req, Message: NewModelTextMessage("ok")}, nil
+	})
+
+	want := []string{"tool_delta", "tool_alpha", "tool_charlie", "tool_bravo"}
+	tools := make([]ToolRef, 0, len(want))
+	for _, name := range want {
+		tools = append(tools, DefineTool(reg, name, "test tool", func(_ *ToolContext, input struct{}) (string, error) {
+			return "ok", nil
+		}))
+	}
+
+	for range 20 {
+		if _, err := Generate(ctx, reg,
+			WithModel(model),
+			WithTools(tools...),
+			WithPrompt("test"),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Fatalf("tool order mismatch (-want +got):\n%s", diff)
+		}
+	}
+}
+
 func TestValidMessage(t *testing.T) {
 	t.Parallel()
 
