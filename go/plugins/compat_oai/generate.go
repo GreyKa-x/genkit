@@ -162,6 +162,12 @@ func (g *ModelGenerator) WithConfig(config any) *ModelGenerator {
 			g.err = fmt.Errorf("failed to convert config to openai.ChatCompletionNewParams: %w", err)
 			return g
 		}
+		// openai-go v1 does not yet expose prompt_cache_key as a typed field.
+		// Preserve it as an extra top-level request field so OpenAI-compatible
+		// gateways can use the caller's stable cache routing key.
+		if promptCacheKey, ok := cfg["prompt_cache_key"]; ok {
+			openaiConfig.SetExtraFields(map[string]any{"prompt_cache_key": promptCacheKey})
+		}
 	default:
 		g.err = fmt.Errorf("unexpected config type: %T", config)
 		return g

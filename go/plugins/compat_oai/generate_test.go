@@ -15,11 +15,34 @@
 package compat_oai
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/firebase/genkit/go/ai"
 	"github.com/openai/openai-go"
 )
+
+func TestWithConfigPreservesPromptCacheKey(t *testing.T) {
+	g := newGen().WithConfig(map[string]any{
+		"temperature":      0.2,
+		"prompt_cache_key": "advoo:session-1",
+	})
+	if g.err != nil {
+		t.Fatalf("WithConfig() error = %v", g.err)
+	}
+
+	raw, err := json.Marshal(g.GetRequest())
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	var request map[string]any
+	if err := json.Unmarshal(raw, &request); err != nil {
+		t.Fatalf("unmarshal request: %v", err)
+	}
+	if request["prompt_cache_key"] != "advoo:session-1" {
+		t.Fatalf("prompt_cache_key = %v, want advoo:session-1", request["prompt_cache_key"])
+	}
+}
 
 // newGen returns a ModelGenerator with a nil client; only local tool-shaping
 // logic is exercised, so no network call is made.
