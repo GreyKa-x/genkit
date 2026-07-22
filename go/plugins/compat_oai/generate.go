@@ -308,6 +308,7 @@ func (g *ModelGenerator) generateStream(ctx context.Context, handleChunk func(co
 	for stream.Next() {
 		chunk := stream.Current()
 		acc.AddChunk(chunk)
+		preserveStreamUsageDetails(&acc.ChatCompletion.Usage, chunk.Usage)
 
 		if len(chunk.Choices) == 0 {
 			continue
@@ -347,6 +348,17 @@ func (g *ModelGenerator) generateStream(ctx context.Context, handleChunk func(co
 
 	// Convert accumulated ChatCompletion to ai.ModelResponse
 	return convertChatCompletionToModelResponse(&acc.ChatCompletion)
+}
+
+// preserveStreamUsageDetails keeps nested usage fields that openai-go's
+// ChatCompletionAccumulator does not currently merge from stream chunks.
+func preserveStreamUsageDetails(accumulated *openai.CompletionUsage, chunk openai.CompletionUsage) {
+	if chunk.JSON.PromptTokensDetails.Valid() {
+		accumulated.PromptTokensDetails = chunk.PromptTokensDetails
+	}
+	if chunk.JSON.CompletionTokensDetails.Valid() {
+		accumulated.CompletionTokensDetails = chunk.CompletionTokensDetails
+	}
 }
 
 // convertChatCompletionToModelResponse converts openai.ChatCompletion to ai.ModelResponse

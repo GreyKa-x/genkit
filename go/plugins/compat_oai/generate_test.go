@@ -44,6 +44,57 @@ func TestWithConfigPreservesPromptCacheKey(t *testing.T) {
 	}
 }
 
+func TestPreserveStreamUsageDetails(t *testing.T) {
+	var chunk openai.ChatCompletionChunk
+	if err := json.Unmarshal([]byte(`{
+		"id":"chatcmpl-test",
+		"object":"chat.completion.chunk",
+		"created":1,
+		"model":"test-model",
+		"choices":[],
+		"usage":{
+			"prompt_tokens":76481,
+			"completion_tokens":5,
+			"total_tokens":76486,
+			"prompt_tokens_details":{"cached_tokens":65280,"audio_tokens":3},
+			"completion_tokens_details":{"reasoning_tokens":4,"audio_tokens":2,"accepted_prediction_tokens":1,"rejected_prediction_tokens":6}
+		}
+	}`), &chunk); err != nil {
+		t.Fatalf("unmarshal stream chunk: %v", err)
+	}
+
+	accumulated := openai.CompletionUsage{
+		PromptTokens:     chunk.Usage.PromptTokens,
+		CompletionTokens: chunk.Usage.CompletionTokens,
+		TotalTokens:      chunk.Usage.TotalTokens,
+	}
+	preserveStreamUsageDetails(&accumulated, chunk.Usage)
+
+	completion := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{{}},
+		Usage:   accumulated,
+	}
+	response, err := convertChatCompletionToModelResponse(completion)
+	if err != nil {
+		t.Fatalf("convert response: %v", err)
+	}
+	if got, want := response.Usage.CachedContentTokens, 65280; got != want {
+		t.Fatalf("cached content tokens = %d, want %d", got, want)
+	}
+	if got, want := response.Usage.ThoughtsTokens, 4; got != want {
+		t.Fatalf("thoughts tokens = %d, want %d", got, want)
+	}
+	if got, want := response.Usage.Custom["audioTokens"], float64(2); got != want {
+		t.Fatalf("audio tokens = %v, want %v", got, want)
+	}
+	if got, want := response.Usage.Custom["acceptedPredictionTokens"], float64(1); got != want {
+		t.Fatalf("accepted prediction tokens = %v, want %v", got, want)
+	}
+	if got, want := response.Usage.Custom["rejectedPredictionTokens"], float64(6); got != want {
+		t.Fatalf("rejected prediction tokens = %v, want %v", got, want)
+	}
+}
+
 // newGen returns a ModelGenerator with a nil client; only local tool-shaping
 // logic is exercised, so no network call is made.
 func newGen() *ModelGenerator {
