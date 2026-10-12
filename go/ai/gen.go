@@ -184,6 +184,8 @@ type GenerationCommonConfig struct {
 // generated. TotalTokens is the provider's own total when it reports one, and
 // otherwise InputTokens + OutputTokens + ThoughtsTokens.
 type GenerationUsage struct {
+	// RequestID identifies the gateway consumption record, distinct from a completion ID.
+	RequestID string `json:"requestId,omitempty"`
 	// CacheWriteTokens counts the input tokens written to the provider's cache,
 	// which some providers bill above the base input rate. They are part of
 	// InputTokens.

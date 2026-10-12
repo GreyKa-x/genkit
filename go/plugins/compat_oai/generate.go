@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net/http"
 	"reflect"
 	"slices"
 	"strings"
@@ -30,6 +31,7 @@ import (
 	pluginjsonschema "github.com/firebase/genkit/go/plugins/internal/jsonschema"
 	"github.com/firebase/genkit/go/plugins/internal/uri"
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/packages/param"
 	"github.com/openai/openai-go/shared"
 )
@@ -658,7 +660,8 @@ func (g *ModelGenerator) generateStream(ctx context.Context, req *ai.ModelReques
 	// without usage would otherwise report zero tokens for every stream.
 	g.request.StreamOptions.IncludeUsage = openai.Bool(true)
 
-	stream := g.client.Chat.Completions.NewStreaming(ctx, *g.request)
+	var httpResponse *http.Response
+	stream := g.client.Chat.Completions.NewStreaming(ctx, *g.request, option.WithResponseInto(&httpResponse))
 	defer func() {
 		_ = stream.Close()
 	}()
@@ -788,6 +791,7 @@ func (g *ModelGenerator) generateStream(ctx context.Context, req *ai.ModelReques
 		resp.Custom = custom
 		resp.Raw = custom
 	}
+	setGatewayRequestID(resp, httpResponse)
 	resp.Request = req
 	return resp, nil
 }
@@ -1105,7 +1109,8 @@ func addCustomTokens(usage *ai.GenerationUsage, name string, count int) {
 
 // generateComplete generates a complete model response
 func (g *ModelGenerator) generateComplete(ctx context.Context, req *ai.ModelRequest) (*ai.ModelResponse, error) {
-	completion, err := g.client.Chat.Completions.New(ctx, *g.request)
+	var httpResponse *http.Response
+	completion, err := g.client.Chat.Completions.New(ctx, *g.request, option.WithResponseInto(&httpResponse))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create completion: %w", classifyAPIError(err, g.classify))
 	}
@@ -1116,6 +1121,7 @@ func (g *ModelGenerator) generateComplete(ctx context.Context, req *ai.ModelRequ
 	}
 
 	// Set the original request
+	setGatewayRequestID(resp, httpResponse)
 	resp.Request = req
 
 	return resp, nil
@@ -1174,4 +1180,19 @@ func anyToJSONString(data any) (string, error) {
 		return "", status.Errorf(status.ErrInvalidArgument, "failed to marshal any to JSON string: data %#v: %w", data, err)
 	}
 	return string(jsonBytes), nil
+}
+
+// Only trust the gateway response header, never the provider completion ID.
+func setGatewayRequestID(resp *ai.ModelResponse, response *http.Response) {
+	if resp == nil || response == nil {
+		return
+	}
+	id := response.Header.Get("X-Oneapi-Request-Id")
+	if id == "" {
+		return
+	}
+	if resp.Usage == nil {
+		resp.Usage = &ai.GenerationUsage{}
+	}
+	resp.Usage.RequestID = id
 }

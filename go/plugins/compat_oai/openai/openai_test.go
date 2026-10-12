@@ -19,6 +19,7 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -620,5 +621,36 @@ func TestModelsOverride(t *testing.T) {
 	info := embedder.(*ai.EmbedderAction).Desc().Metadata["info"].(map[string]any)
 	if got := info["dimensions"]; got != 64 {
 		t.Errorf("dimensions = %v (%T), want the override's 64", got, got)
+	}
+}
+
+func TestGatewayRequestIDSurvivesGenerate(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprint(streaming), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Oneapi-Request-Id", "gateway-record-123")
+				if streaming {
+					w.Header().Set("Content-Type", "text/event-stream")
+					io.WriteString(w, "data: {\"id\":\"provider-completion\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n")
+					io.WriteString(w, "data: {\"id\":\"provider-completion\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\ndata: [DONE]\n\n")
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					io.WriteString(w, `{"id":"provider-completion","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`)
+				}
+			}))
+			defer server.Close()
+			g := genkit.Init(context.Background(), genkit.WithPlugins(&OpenAI{APIKey: "test", Opts: []option.RequestOption{option.WithBaseURL(server.URL + "/v1")}}))
+			opts := []ai.GenerateOption{ai.WithModelName("openai/gpt-4o"), ai.WithPrompt("hi")}
+			if streaming {
+				opts = append(opts, ai.WithStreaming(func(context.Context, *ai.ModelResponseChunk) error { return nil }))
+			}
+			response, err := genkit.Generate(context.Background(), g, opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.Usage == nil || response.Usage.RequestID != "gateway-record-123" || response.Usage.InputTokens != 10 {
+				t.Fatalf("lost gateway record: %+v", response.Usage)
+			}
+		})
 	}
 }
