@@ -224,6 +224,11 @@ func TestConvertUsage(t *testing.T) {
 			want:  ai.GenerationUsage{InputTokens: 194, OutputTokens: 2, CacheWriteTokens: 100, TotalTokens: 196},
 		},
 		{
+			name:  "openrouter cache write",
+			usage: `{"prompt_tokens":194,"completion_tokens":2,"total_tokens":196,"prompt_tokens_details":{"cached_tokens":0,"cached_creation_tokens":100,"audio_tokens":0},"completion_tokens_details":{"reasoning_tokens":0}}`,
+			want:  ai.GenerationUsage{InputTokens: 194, OutputTokens: 2, CacheWriteTokens: 100, TotalTokens: 196},
+		},
+		{
 			name:  "no total reported",
 			usage: `{"prompt_tokens":10,"completion_tokens":7,"completion_tokens_details":{"reasoning_tokens":5}}`,
 			want:  ai.GenerationUsage{InputTokens: 10, OutputTokens: 2, ThoughtsTokens: 5, TotalTokens: 17},

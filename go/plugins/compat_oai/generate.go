@@ -1050,14 +1050,19 @@ func convertUsage(u openai.CompletionUsage, separateReasoning bool) *ai.Generati
 		cached = extractTokenCount(u.JSON.ExtraFields["prompt_cache_hit_tokens"].Raw())
 	}
 
+	// New API's Claude conversion uses cached_creation_tokens for cache writes.
+	cacheWriteRaw := u.PromptTokensDetails.JSON.ExtraFields["cache_write_tokens"].Raw()
+	if cacheWriteRaw == "" {
+		cacheWriteRaw = u.PromptTokensDetails.JSON.ExtraFields["cached_creation_tokens"].Raw()
+	}
+
 	usage := &ai.GenerationUsage{
 		InputTokens:         int(u.PromptTokens),
 		OutputTokens:        completion,
 		ThoughtsTokens:      reasoning,
 		TotalTokens:         total,
 		CachedContentTokens: cached,
-		CacheWriteTokens: extractTokenCount(
-			u.PromptTokensDetails.JSON.ExtraFields["cache_write_tokens"].Raw()),
+		CacheWriteTokens:    extractTokenCount(cacheWriteRaw),
 	}
 
 	// Add the token counts Genkit has no field of its own for.
