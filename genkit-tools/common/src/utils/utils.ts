@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import * as fsSync from 'fs';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { Runtime } from '../manager/types';
@@ -40,6 +41,7 @@ export async function findProjectRoot(): Promise<string> {
     'requirements.txt',
     'pom.xml',
     'build.gradle',
+    'build.gradle.kts',
     'pubspec.yaml',
   ];
 
@@ -122,20 +124,59 @@ export function projectNameFromGenkitFilePath(filePath: string): string {
 }
 
 /**
+ * Maps a filename to a Genkit SDK runtime if it is a recognized marker file.
+ */
+function matchRuntimeMarker(file: string, isFile: boolean): Runtime {
+  if (!isFile) return undefined;
+  if (path.extname(file) === '.go' || file === 'go.mod') {
+    return 'go';
+  }
+  if (file === 'pyproject.toml' || file === 'requirements.txt') {
+    return 'python';
+  }
+  if (file === 'pubspec.yaml') {
+    return 'dart';
+  }
+  if (
+    file === 'pom.xml' ||
+    file === 'build.gradle' ||
+    file === 'build.gradle.kts'
+  ) {
+    return 'java';
+  }
+  return undefined;
+}
+
+/**
  * Detects what runtime is used in the current directory.
  * @returns Runtime of the project directory.
  */
 export async function detectRuntime(directory: string): Promise<Runtime> {
-  const files = await fs.readdir(directory);
-  for (const file of files) {
-    const filePath = path.join(directory, file);
-    const stat = await fs.stat(filePath);
-    if (stat.isFile() && (path.extname(file) === '.go' || file === 'go.mod')) {
-      return 'go';
-    }
-  }
   try {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const runtime = matchRuntimeMarker(entry.name, entry.isFile());
+      if (runtime) return runtime;
+    }
     await fs.access(path.join(directory, 'package.json'));
+    return 'nodejs';
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Synchronously detects what runtime is used in the current directory.
+ * @returns Runtime of the project directory.
+ */
+export function detectRuntimeSync(directory: string): Runtime {
+  try {
+    const entries = fsSync.readdirSync(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const runtime = matchRuntimeMarker(entry.name, entry.isFile());
+      if (runtime) return runtime;
+    }
+    fsSync.accessSync(path.join(directory, 'package.json'));
     return 'nodejs';
   } catch {
     return undefined;
@@ -271,4 +312,85 @@ export async function removeToolsInfoFile(
   } catch (error) {
     logger.debug(`Failed to delete toolsInfo file: ${error}`);
   }
+}
+
+/**
+ * Sanitizes base64 data URLs (e.g. `data:image/png;base64,...`) in strings or nested objects
+ * by replacing inline data with summary placeholders, unless `keepBase64` is true.
+ */
+export function sanitizeBase64DataUrls(
+  val: any,
+  keepBase64: boolean = false
+): any {
+  if (typeof val === 'string') {
+    if (!keepBase64) {
+      const result = val.replace(
+        /data:([a-zA-Z0-9-]+\/[a-zA-Z0-9-+.]+);base64,([A-Za-z0-9+/=]+)/g,
+        (match, mime, b64) => {
+          const approxBytes = Math.round((b64.length * 3) / 4);
+          const sizeStr =
+            approxBytes > 1024
+              ? `${(approxBytes / 1024).toFixed(1)} KB`
+              : `${approxBytes} B`;
+          return `data:${mime};base64,<... ${sizeStr} base64 data ...>`;
+        }
+      );
+
+      // Heuristic for generic base64 data.
+      if (result.length > 80 && /^[A-Za-z0-9+/=]+$/.test(result)) {
+        const approxBytes = Math.round((result.length * 3) / 4);
+        const sizeStr =
+          approxBytes > 1024
+            ? `${(approxBytes / 1024).toFixed(1)} KB`
+            : `${approxBytes} B`;
+        return `${result.substring(0, 15)}<... ${sizeStr} base64 data ...>`;
+      }
+      return result;
+    }
+    return val;
+  }
+  if (Array.isArray(val)) {
+    return val.map((item) => sanitizeBase64DataUrls(item, keepBase64));
+  }
+  if (val && typeof val === 'object') {
+    const res: Record<string, any> = {};
+    for (const [k, v] of Object.entries(val)) {
+      res[k] = sanitizeBase64DataUrls(v, keepBase64);
+    }
+    return res;
+  }
+  return val;
+}
+
+/**
+ * Safely parses stringified JSON payloads if valid JSON, then sanitizes base64 data URLs.
+ */
+export function parseAndSanitizeJson(
+  val: any,
+  keepBase64: boolean = false
+): any {
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (
+      (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+      (trimmed.startsWith('[') && trimmed.endsWith(']'))
+    ) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return sanitizeBase64DataUrls(parsed, keepBase64);
+      } catch {
+        // Not valid JSON
+      }
+    }
+  }
+  return sanitizeBase64DataUrls(val, keepBase64);
+}
+
+/** Formats a start and end timestamp into a human-readable duration string (e.g. "12ms" or "0.50ms"). */
+export function formatDuration(startTime?: number, endTime?: number): string {
+  if (startTime !== undefined && endTime !== undefined) {
+    const ms = Math.max(0, endTime - startTime);
+    return `${ms < 1 ? ms.toFixed(2) : Math.round(ms)}ms`;
+  }
+  return '';
 }

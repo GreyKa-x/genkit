@@ -14,49 +14,47 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""FastAPI Plugin for Genkit.
+"""Serve Genkit flows as FastAPI routes.
 
-This plugin provides FastAPI integration for Genkit, enabling you to expose
-Genkit flows as HTTP endpoints in a FastAPI application.
+With ``GENKIT_ENV=dev``, the Dev UI reflection server starts on a background
+thread. No lifespan wiring needed.
 
-The Dev UI reflection server starts automatically in a background thread when
-``GENKIT_ENV=dev`` is set — no lifespan wiring needed.
+```python
+from fastapi import FastAPI
+from genkit import Genkit
+from genkit_fastapi import serve_flow
+from genkit_google_genai import GoogleAI
 
-Example:
-    ```python
-    from fastapi import FastAPI
-    from genkit import Genkit
-    from genkit_fastapi import genkit_fastapi_handler
-    from genkit_google_genai import GoogleAI
-
-    ai = Genkit(plugins=[GoogleAI()])
-    app = FastAPI()
+ai = Genkit(plugins=[GoogleAI()], model=GoogleAI.gemini_model('gemini-flash-latest'))
+app = FastAPI()
 
 
-    @app.post('/chat', response_model=None)
-    @genkit_fastapi_handler(ai)
-    @ai.flow()
-    async def chat_flow(prompt: str) -> str:
-        response = await ai.generate(prompt=prompt)
-        return response.text
-    ```
+@ai.flow()
+async def suggest_dish(cuisine: str) -> str:
+    response = await ai.generate(prompt=f'Suggest one {cuisine} dish.')
+    return response.text
 
-Running:
-    ```bash
-    # With Genkit Dev UI
-    genkit start -- uvicorn main:app --reload
 
-    # Production (no Dev UI)
-    uvicorn main:app
-    ```
+# POST /api/suggest_dish
+app.include_router(serve_flow(suggest_dish), prefix='/api')
+```
+
+For a custom route, stack ``@genkit_fastapi_handler(ai)`` over ``@ai.flow()``.
+
+Agents are experimental, so their routes come from ``genkit_fastapi.exp``::
+
+    from genkit_fastapi.exp import serve_agent
+
+```bash
+genkit start -- uvicorn main:app --reload  # with Dev UI
+uvicorn main:app                           # production
+```
 """
 
-from .handler import genkit_fastapi_handler
+from ._handler import genkit_fastapi_handler, handle_genkit_request, serve_flow
 
-
-def package_name() -> str:
-    """Get the package name for the FastAPI plugin."""
-    return 'genkit_fastapi'
-
-
-__all__ = ['package_name', 'genkit_fastapi_handler']
+__all__ = [
+    'genkit_fastapi_handler',
+    'handle_genkit_request',
+    'serve_flow',
+]

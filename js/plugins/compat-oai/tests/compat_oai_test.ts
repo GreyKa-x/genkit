@@ -1500,6 +1500,63 @@ describe('toOpenAiRequestBody', () => {
       },
     });
   });
+
+  it('sets strict inside json_schema when configured', () => {
+    const schema = {
+      type: 'object',
+      properties: { foo: { type: 'string' } },
+      required: ['foo'],
+      additionalProperties: false,
+    };
+    const request = {
+      messages: [{ role: 'user', content: [{ text: 'hello' }] }],
+      config: { strict: true },
+      output: { format: 'json', schema },
+    } as unknown as GenerateRequest;
+
+    const actualOutput = toOpenAIRequestBody('gpt-5', request) as any;
+
+    expect(actualOutput.response_format).toStrictEqual({
+      type: 'json_schema',
+      json_schema: {
+        name: 'output',
+        schema,
+        strict: true,
+      },
+    });
+    expect(actualOutput.strict).toBeUndefined();
+  });
+
+  it('preserves strict false inside json_schema', () => {
+    const schema = {
+      type: 'object',
+      properties: { foo: { type: 'string' } },
+      required: ['foo'],
+      additionalProperties: false,
+    };
+    const request = {
+      messages: [{ role: 'user', content: [{ text: 'hello' }] }],
+      config: { strict: false },
+      output: { format: 'json', schema },
+    } as unknown as GenerateRequest;
+
+    const actualOutput = toOpenAIRequestBody('gpt-5', request) as any;
+
+    expect(actualOutput.response_format.json_schema.strict).toBe(false);
+    expect(actualOutput.strict).toBeUndefined();
+  });
+
+  it('rejects strict output without a JSON schema', () => {
+    const request = {
+      messages: [{ role: 'user', content: [{ text: 'hello' }] }],
+      config: { strict: true },
+      output: { format: 'json' },
+    } as unknown as GenerateRequest;
+
+    expect(() => toOpenAIRequestBody('gpt-5', request)).toThrow(
+      'OpenAI strict output requires output.format="json" and an output schema.'
+    );
+  });
 });
 
 describe('openAIModelRunner', () => {
@@ -1939,7 +1996,7 @@ describe('openAIModelRunner', () => {
         })
       ).rejects.toThrow(
         expect.objectContaining({
-          status: 'PERMISSION_DENIED',
+          status: 'UNAUTHENTICATED',
           message: expect.stringContaining('Incorrect API key provided'),
         })
       );
@@ -1958,7 +2015,7 @@ describe('openAIModelRunner', () => {
         })
       ).rejects.toThrow(
         expect.objectContaining({
-          status: 'PERMISSION_DENIED',
+          status: 'UNAUTHENTICATED',
           message: expect.stringContaining('Incorrect API key provided'),
         })
       );
@@ -1976,6 +2033,26 @@ describe('openAIModelRunner', () => {
           {}
         ),
         expectedStatus: 'RESOURCE_EXHAUSTED',
+      },
+      {
+        name: '401',
+        error: new APIError(
+          401,
+          { error: { message: 'Incorrect API key provided' } },
+          '',
+          {}
+        ),
+        expectedStatus: 'UNAUTHENTICATED',
+      },
+      {
+        name: '403',
+        error: new APIError(
+          403,
+          { error: { message: 'Project does not have access' } },
+          '',
+          {}
+        ),
+        expectedStatus: 'PERMISSION_DENIED',
       },
       {
         name: '400',

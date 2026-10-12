@@ -674,13 +674,32 @@ export type GetSnapshotDataAction<S = unknown> = Action<
 >;
 
 /**
+ * Call options accepted by the in-process {@link Agent}'s {@link AgentAPI}
+ * surface (`chat`, `loadChat`, `getSnapshot`, `abort`, and the `AgentChat`
+ * methods). `remoteAgent` does not accept these: over HTTP the context is
+ * derived server-side from the request.
+ */
+export interface LocalAgentOptions {
+  /**
+   * Action context (ex. auth) for agent turns and session store calls.
+   *
+   * When omitted, `chat` / `loadChat` bind the ambient context
+   * (`getContext()`) at creation, so the chat and its detached tasks keep that
+   * identity. Other calls (`getSnapshot`, `abort`, or a chat created with no
+   * ambient context) use the ambient context at call time.
+   */
+  context?: ActionContext;
+}
+
+/**
  * Represents a configured, registered Agent.
  *
  * An `Agent` exposes two surfaces:
  *
  * 1. The ergonomic, transport-agnostic {@link AgentAPI} (`chat`, `loadChat`,
  *    `getSnapshot`, `abort`) - the same surface returned by `remoteAgent` on
- *    the client, so server- and client-side code share one interface.
+ *    the client, so server- and client-side code share one interface. It also
+ *    accepts {@link LocalAgentOptions} (ex. `context`).
  * 2. The lower-level {@link BidiAction} surface (`run`, `streamBidi`, …) for
  *    advanced use and for serving over HTTP.
  */
@@ -691,7 +710,7 @@ export interface Agent<State = unknown>
       typeof AgentStreamChunkSchema,
       typeof AgentInitSchema
     >,
-    AgentAPI<State> {
+    AgentAPI<State, LocalAgentOptions> {
   getSnapshotData(
     opts: GetSnapshotDataInput
   ): Promise<SessionSnapshot<State> | undefined>;
@@ -1386,10 +1405,17 @@ export function defineCustomAgent<State = unknown>(
     }
   );
 
+  // Direct store calls default to the ambient context, same as the registered
+  // snapshot/abort actions above, so tenant-scoped stores see the caller's
+  // context even when it is not passed explicitly.
   const composite = Object.assign(primaryAction, {
-    getSnapshotData: (opts: GetSnapshotDataInput) => resolveSnapshot(opts),
+    getSnapshotData: (opts: GetSnapshotDataInput) =>
+      resolveSnapshot({ ...opts, context: opts.context ?? getContext() }),
     abort: (snapshotId: string, options?: SessionStoreOptions) =>
-      runAbort(snapshotId, options),
+      runAbort(snapshotId, {
+        ...options,
+        context: options?.context ?? getContext(),
+      }),
     getSnapshotDataAction:
       getSnapshotDataAction as unknown as GetSnapshotDataAction<State>,
     abortAgentAction: abortAgentAction as unknown as Action<
@@ -1399,14 +1425,16 @@ export function defineCustomAgent<State = unknown>(
   });
 
   // Opens a single-turn bidi stream: send the input, close the send side, and
-  // hand back the live `{ stream, output }` handle.
+  // hand back the live `{ stream, output }` handle. An omitted `context` falls
+  // back to the ambient one inside the action itself.
   const startBidi = (
     input: AgentInput,
     init: AgentInit,
-    opts: { abortSignal: AbortSignal }
+    opts: LocalAgentOptions & { abortSignal: AbortSignal }
   ) => {
     const bidi = primaryAction.streamBidi(init, {
       abortSignal: opts.abortSignal,
+      context: opts.context,
     });
     bidi.send(input);
     bidi.close();
@@ -1416,7 +1444,7 @@ export function defineCustomAgent<State = unknown>(
   // In-process transport: drives the agent action directly (no HTTP). This lets
   // the server-side agent expose the same ergonomic AgentAPI (`chat`,
   // `loadChat`, `getSnapshot`, `abort`) as the HTTP `remoteAgent` client.
-  const transport: AgentTransport = {
+  const transport: AgentTransport<LocalAgentOptions> = {
     stateManagement: config.store ? 'server' : 'client',
 
     runTurn(input, init, opts) {
@@ -1424,23 +1452,39 @@ export function defineCustomAgent<State = unknown>(
       return { stream: bidi.stream, output: bidi.output };
     },
 
-    async getSnapshot(lookup: SnapshotLookup) {
-      return composite.getSnapshotData(lookup);
+    async getSnapshot(lookup: SnapshotLookup, opts?: LocalAgentOptions) {
+      return composite.getSnapshotData({ ...lookup, context: opts?.context });
     },
 
-    abort(snapshotId: string) {
-      return composite.abort(snapshotId);
+    abort(snapshotId: string, opts?: LocalAgentOptions) {
+      return composite.abort(snapshotId, { context: opts?.context });
     },
   };
 
-  const agentApi = createAgentAPI<State>(transport);
+  const agentApi = createAgentAPI<State, LocalAgentOptions>(transport);
+
+  // Chats capture the ambient context at creation when none is passed, so the
+  // chat (and any task it detaches) keeps the identity it was created under,
+  // even if later driven from a timer, queue worker, or another request.
+  const withAmbientContext = (
+    opts?: LocalAgentOptions
+  ): LocalAgentOptions | undefined => {
+    const context = opts?.context ?? getContext();
+    return context ? { ...opts, context } : opts;
+  };
+  const chat: AgentAPI<State, LocalAgentOptions>['chat'] = (init, opts) =>
+    agentApi.chat(init, withAmbientContext(opts));
+  const loadChat: AgentAPI<State, LocalAgentOptions>['loadChat'] = (
+    lookup,
+    opts
+  ) => agentApi.loadChat(lookup, withAmbientContext(opts));
 
   // Expose the AgentAPI surface on the composite. `abort`/`getSnapshotData`
   // already exist on the composite (richer signatures); we add `chat`,
   // `loadChat`, and `getSnapshot`.
   Object.assign(composite, {
-    chat: agentApi.chat,
-    loadChat: agentApi.loadChat,
+    chat,
+    loadChat,
     getSnapshot: agentApi.getSnapshot,
   });
 
@@ -1638,28 +1682,27 @@ export function validateResumeAgainstHistory(
   },
   history: MessageData[]
 ): void {
-  // Collect all tool requests from all model messages in the stored history.
-  const allToolRequests: Array<{
-    name: string;
-    ref?: string;
-    input?: unknown;
-  }> = [];
-  for (const msg of history) {
-    if (msg.role === 'model') {
-      for (const part of msg.content) {
-        if (part.toolRequest) {
-          allToolRequests.push(part.toolRequest);
+  // Searches history newest-first so a resume matches the most recent tool
+  // request for a given name + ref.
+  const findToolRequest = (name: string, ref?: string) => {
+    for (let i = history.length - 1; i >= 0; i--) {
+      const msg = history[i];
+      if (msg.role === 'model') {
+        for (const part of msg.content) {
+          const tr = part.toolRequest;
+          if (tr && tr.name === name && tr.ref === ref) {
+            return tr;
+          }
         }
       }
     }
-  }
+    return undefined;
+  };
 
   // Validate restart entries: name + ref must exist AND input must match exactly
   for (const restart of resume.restart || []) {
     const { name, ref, input } = restart.toolRequest;
-    const match = allToolRequests.find(
-      (tr) => tr.name === name && tr.ref === ref
-    );
+    const match = findToolRequest(name, ref);
     if (!match) {
       throw new GenkitError({
         status: 'INVALID_ARGUMENT',
@@ -1685,9 +1728,7 @@ export function validateResumeAgainstHistory(
   // Validate respond entries: name + ref must match a tool request in history
   for (const respond of resume.respond || []) {
     const { name, ref } = respond.toolResponse;
-    const match = allToolRequests.find(
-      (tr) => tr.name === name && tr.ref === ref
-    );
+    const match = findToolRequest(name, ref);
     if (!match) {
       throw new GenkitError({
         status: 'INVALID_ARGUMENT',

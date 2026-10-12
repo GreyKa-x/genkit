@@ -1,6 +1,6 @@
 # Genkit Evaluators Plugin
 
-Provides three rule-based evaluators matching the Go and JS implementations:
+Provides three built-in rule-based evaluators:
 
 - **regex** – Tests output against a regex pattern (reference = regex string)
 - **deep_equal** – Tests equality of output against reference
@@ -8,31 +8,47 @@ Provides three rule-based evaluators matching the Go and JS implementations:
 
 No LLM or API keys required.
 
+> **Building with a coding agent? Install the Genkit Python skill first.**
+>
+> ```bash
+> npx skills add genkit-ai/skills --skill developing-genkit-python
+> ```
+>
+> It teaches your agent the current Genkit Python APIs and common gotchas.
+> Source, manual install and skills for other languages:
+> [genkit-ai/skills](https://github.com/genkit-ai/skills).
+
 ## Installation
 
 ```bash
-pip install genkit-plugin-evaluators
+uv add genkit-evaluators
 ```
 
 ## Usage
 
 ```python
 from genkit import Genkit
-from genkit_evaluators import GenkitEval
+from genkit.evaluator import BaseDataPoint
+from genkit_evaluators import register_genkit_evaluators
 
-ai = Genkit(plugins=[GenkitEval()])
+ai = Genkit()
+register_genkit_evaluators(ai)
 
-# Run evaluation with genkit eval-flow or programmatically
-evaluator = await ai.registry.resolve_evaluator('genkitEval/regex')
-result = await evaluator.run(
-    input={
-        'dataset': [
-            {'input': 'sample', 'output': 'banana', 'reference': 'ba?a?a'},
-            {'input': 'sample', 'output': 'apple', 'reference': 'ba?a?a'},
-        ],
-        'evalRunId': 'test',
-    }
+results = await ai.evaluate(
+    evaluator='genkitEval/regex',
+    dataset=[
+        BaseDataPoint(input='sample', output='banana', reference='ba?a?a'),
+        BaseDataPoint(input='sample', output='apple', reference='ba?a?a'),
+    ],
 )
+for row in results:
+    print(row.test_case_id, row.evaluation[0].score)
+```
+
+Or from the CLI:
+
+```bash
+genkit eval:run datasets/example.json --evaluators=genkitEval/regex
 ```
 
 ## Evaluators

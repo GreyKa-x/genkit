@@ -21,42 +21,25 @@ import queue
 import threading
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from genkit_anthropic import Anthropic, anthropic_name
-from genkit_anthropic.model_info import (
+from genkit_anthropic import Anthropic, AnthropicConfig
+from genkit_anthropic._model_info import (
     SUPPORTED_ANTHROPIC_MODELS as SUPPORTED_MODELS,
     get_model_info,
 )
+from genkit_anthropic._models import AnthropicModel
+from genkit_anthropic._plugin import anthropic_name
 
-from genkit import (
-    ActionKind,
-    Constrained,
-    Message,
-    ModelConfig,
-    ModelRequest,
-    Part,
-    Role,
-    TextPart,
-    ToolDefinition,
-)
+from genkit import Genkit, Message, ModelResponse, Part, Role
+from genkit.model import Constrained, ModelRequest, ToolDefinition
+from genkit.plugin_api import ActionKind
 
 
 def test_anthropic_name() -> None:
     """Test anthropic_name helper function."""
     assert anthropic_name('claude-sonnet-4') == 'anthropic/claude-sonnet-4'
-
-
-def test_init_with_api_key() -> None:
-    """Test plugin initialization with API key."""
-    plugin = Anthropic(api_key='test-key')
-
-    async def _get_api_key() -> str | None:
-        return plugin._runtime_client().api_key
-
-    assert asyncio.run(_get_api_key()) == 'test-key'
-    assert plugin.models == list(SUPPORTED_MODELS.keys())
 
 
 def test_init_without_api_key_raises() -> None:
@@ -72,27 +55,54 @@ def test_init_without_api_key_raises() -> None:
         assert asyncio.run(_has_client())
 
 
-def test_init_with_env_var() -> None:
-    """Test plugin initialization with environment variable."""
-    with patch.dict('os.environ', {'ANTHROPIC_API_KEY': 'env-key'}):
-        plugin = Anthropic()
+@patch('genkit_anthropic._plugin.AsyncAnthropic')
+def test_api_version_is_stored_without_leaking_to_sdk(mock_client_ctor: MagicMock) -> None:
+    """Plugin API version is a model default, not an AsyncAnthropic kwarg."""
+    mock_client = MagicMock()
+    mock_client_ctor.return_value = mock_client
+    plugin = Anthropic(api_key='test-key', api_version='beta')
 
-        async def _get_api_key() -> str | None:
-            return plugin._runtime_client().api_key
+    async def _get_client() -> object:
+        return plugin._runtime_client()
 
-        assert asyncio.run(_get_api_key()) == 'env-key'
+    assert asyncio.run(_get_client()) is mock_client
+    assert plugin._default_api_version == 'beta'
+    mock_client_ctor.assert_called_once_with(api_key='test-key')
 
 
-def test_custom_models() -> None:
-    """Test plugin initialization with custom models."""
-    plugin = Anthropic(api_key='test-key', models=['claude-sonnet-4'])
-    assert plugin.models == ['claude-sonnet-4']
+def test_invalid_api_version_fails_fast() -> None:
+    """Invalid plugin API versions fail before an SDK client can be created."""
+    with pytest.raises(ValueError, match='api_version'):
+        Anthropic(api_version=cast(Any, 'Beta'))
+
+
+@patch('genkit_anthropic._plugin.AsyncAnthropic')
+@pytest.mark.asyncio
+async def test_plugin_beta_default_routes_action_run_to_beta_surface(mock_client_ctor: MagicMock) -> None:
+    """The plugin-wide beta default reaches models resolved as public actions."""
+    mock_response = MagicMock()
+    mock_response.content = [MagicMock(type='text', text='ok')]
+    mock_response.usage = MagicMock(input_tokens=1, output_tokens=1)
+    mock_response.stop_reason = 'end_turn'
+
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_response)
+    mock_client.beta.messages.create = AsyncMock(return_value=mock_response)
+    mock_client_ctor.return_value = mock_client
+
+    plugin = Anthropic(api_key='test-key', api_version='beta')
+    action = plugin._create_model_action('claude-sonnet-4')
+
+    await action.run(_create_sample_request())
+
+    mock_client.beta.messages.create.assert_awaited_once()
+    mock_client.messages.create.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_plugin_init() -> None:
     """Test plugin init method."""
-    plugin = Anthropic(api_key='test-key', models=['claude-sonnet-4'])
+    plugin = Anthropic(api_key='test-key')
 
     # init() should return an empty list (using lazy loading)
     result = await plugin.init()
@@ -105,14 +115,14 @@ async def test_resolve_action_model() -> None:
     plugin = Anthropic(api_key='test-key')
 
     # Test resolving with unprefixed name
-    action = await plugin.resolve(ActionKind.MODEL, 'anthropic/claude-sonnet-4')
+    action = await plugin.resolve(ActionKind.MODEL, 'claude-sonnet-4')
 
     assert action is not None
     assert action.name == 'anthropic/claude-sonnet-4'
     assert action.kind == ActionKind.MODEL
 
 
-@patch('genkit_anthropic.plugin.AsyncAnthropic')
+@patch('genkit_anthropic._plugin.AsyncAnthropic')
 @pytest.mark.asyncio
 async def test_anthropic_runtime_clients_are_loop_local(mock_client_ctor: MagicMock) -> None:
     """Runtime Anthropic clients are cached per event loop."""
@@ -347,7 +357,6 @@ async def test_list_actions_empty_api_response_returns_and_caches_statics() -> N
 
 
 _ANTHROPIC_CONFIG_KEYS = {
-    'apiKey',
     'apiVersion',
     'betas',
     'maxOutputTokens',
@@ -369,7 +378,7 @@ async def test_resolve_advertises_anthropic_config() -> None:
     """resolve() metadata customOptions reflects the typed AnthropicConfig."""
     plugin = Anthropic(api_key='test-key')
 
-    action = await plugin.resolve(ActionKind.MODEL, 'anthropic/claude-sonnet-4')
+    action = await plugin.resolve(ActionKind.MODEL, 'claude-sonnet-4')
 
     assert action is not None
     custom_options = _custom_options(action.metadata)
@@ -394,16 +403,57 @@ async def test_list_actions_advertises_anthropic_config() -> None:
         assert _ANTHROPIC_CONFIG_KEYS <= properties
 
 
+@pytest.mark.asyncio
+async def test_generate_anthropic_resolved_model_sends_id_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`anthropic/claude-unlisted-test` sends `claude-unlisted-test` and is named with the plugin prefix."""
+    seen: list[str] = []
+
+    async def fake_generate(self: AnthropicModel, request: object, ctx: object) -> ModelResponse:
+        seen.append(self.model_name)
+        return ModelResponse(message=Message(role=Role.MODEL, content=[Part.from_text('ok')]))
+
+    monkeypatch.setattr(AnthropicModel, 'generate', fake_generate)
+    ai = Genkit(plugins=[Anthropic(api_key='test-key')])
+
+    response = await ai.generate(model='anthropic/claude-unlisted-test', prompt='hi')
+    action = await ai.lookup_model('anthropic/claude-unlisted-test')
+
+    assert response.text == 'ok'
+    assert seen == ['claude-unlisted-test']
+    assert action is not None
+    assert action.name == 'anthropic/claude-unlisted-test'
+
+
+@pytest.mark.asyncio
+async def test_generate_anthropic_double_prefixed_id_sends_prefixed_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`anthropic/anthropic/claude-x` sends `anthropic/claude-x`; only one `anthropic/` is removed."""
+    seen: list[str] = []
+
+    async def fake_generate(self: AnthropicModel, request: object, ctx: object) -> ModelResponse:
+        seen.append(self.model_name)
+        return ModelResponse(message=Message(role=Role.MODEL, content=[Part.from_text('ok')]))
+
+    monkeypatch.setattr(AnthropicModel, 'generate', fake_generate)
+    ai = Genkit(plugins=[Anthropic(api_key='test-key')])
+
+    await ai.generate(model='anthropic/anthropic/claude-x', prompt='hi')
+    action = await ai.lookup_model('anthropic/anthropic/claude-x')
+
+    assert seen == ['anthropic/claude-x']
+    assert action is not None
+    assert action.name == 'anthropic/anthropic/claude-x'
+
+
 def _create_sample_request() -> ModelRequest:
     """Create a sample generation request for testing."""
     return ModelRequest(
         messages=[
             Message(
                 role=Role.USER,
-                content=[Part(root=TextPart(text='Hello, how are you?'))],
+                content=[Part.from_text('Hello, how are you?')],
             )
         ],
-        config=ModelConfig(),
+        config=AnthropicConfig(),
         tools=[
             ToolDefinition(
                 name='get_weather',

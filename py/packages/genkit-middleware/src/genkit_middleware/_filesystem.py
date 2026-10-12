@@ -40,21 +40,21 @@ from typing import Any
 
 from pydantic import BaseModel as PydanticBaseModel
 
-from genkit._ai._tools import Interrupt, define_tool
-from genkit._core._model import Message, ModelResponse, ModelResponseChunk
-from genkit._core._registry import Registry
-from genkit._core._typing import (
-    Media,
-    MediaPart,
+from genkit import (
+    Interrupt,
+    Message,
+    ModelResponse,
+    ModelResponseChunk,
+    MultipartToolResponse,
     Part,
     Role,
-    TextPart,
+    Tool,
+    tool,
 )
 from genkit.middleware import (
     BaseMiddleware,
     GenerateHookParams,
     GenerateMiddlewareContext,
-    MultipartToolResponse,
     ToolHookParams,
 )
 
@@ -212,7 +212,7 @@ class Filesystem(BaseMiddleware[FilesystemConfig]):
                 raise ValueError(f'Image too large ({len(raw):,} bytes; max {_MAX_READ_SLICE_BYTES:,}).')
             b64 = base64.b64encode(raw).decode('ascii')
             data_uri = f'data:{mime_type};base64,{b64}'
-            self._enqueue_parts([Part(root=MediaPart(media=Media(url=data_uri, content_type=mime_type)))])
+            self._enqueue_parts([Part.from_media(data_uri, content_type=mime_type)])
             return f'Image {file_path} queued as media part.'
 
         with open(abs_path, encoding='utf-8', errors='replace') as fh:
@@ -231,7 +231,7 @@ class Filesystem(BaseMiddleware[FilesystemConfig]):
         else:
             wrapped = f'<read_file path="{file_path}" totalLines="{total}">\n{sliced}\n</read_file>'
 
-        self._enqueue_parts([Part(root=TextPart(text=wrapped))])
+        self._enqueue_parts([Part.from_text(wrapped)])
         return f'File {file_path} read successfully. Content queued as user message.'
 
     def _write_file_impl(self, file_path: str, content: str) -> str:
@@ -268,9 +268,8 @@ class Filesystem(BaseMiddleware[FilesystemConfig]):
             fh.write(content)
         return f'File {file_path} edited successfully.'
 
-    def tools(self, ctx: GenerateMiddlewareContext) -> list[Any]:
-        """Return filesystem tool actions for this generate() call."""
-        scratch = Registry()
+    def tools(self, ctx: GenerateMiddlewareContext) -> list[Tool]:
+        """Return filesystem tools for this generate() call."""
 
         async def list_files(input: _ListFilesInput) -> list[dict[str, Any]]:
             return await asyncio.to_thread(self._list_files, input.dir_path, input.recursive)
@@ -283,9 +282,18 @@ class Filesystem(BaseMiddleware[FilesystemConfig]):
                 input.limit,
             )
 
-        t_list = define_tool(scratch, list_files, name=self._tool_name('list_files'))
-        t_read = define_tool(scratch, read_file, name=self._tool_name('read_file'))
-        tools_out = [t_list.action(), t_read.action()]
+        tools_out = [
+            tool(
+                list_files,
+                name=self._tool_name('list_files'),
+                description='List files and directories under a path (optional recursive).',
+            ),
+            tool(
+                read_file,
+                name=self._tool_name('read_file'),
+                description='Read a text file, optionally from an offset/limit in lines.',
+            ),
+        ]
 
         if self.config.allow_write_access:
 
@@ -299,9 +307,18 @@ class Filesystem(BaseMiddleware[FilesystemConfig]):
                     [e.model_dump() for e in input.edits],
                 )
 
-            t_write = define_tool(scratch, write_file, name=self._tool_name('write_file'))
-            t_edit = define_tool(scratch, edit_file, name=self._tool_name('edit_file'))
-            tools_out += [t_write.action(), t_edit.action()]
+            tools_out += [
+                tool(
+                    write_file,
+                    name=self._tool_name('write_file'),
+                    description='Create or overwrite a text file with the given content.',
+                ),
+                tool(
+                    edit_file,
+                    name=self._tool_name('edit_file'),
+                    description='Apply search/replace edits to an existing text file.',
+                ),
+            ]
 
         return tools_out
 
@@ -349,5 +366,5 @@ class Filesystem(BaseMiddleware[FilesystemConfig]):
             raise
         except Exception as exc:
             error_msg = f'Tool "{params.tool.name}" failed: {exc}'
-            self._enqueue_parts([Part(root=TextPart(text=error_msg))])
+            self._enqueue_parts([Part.from_text(error_msg)])
             return MultipartToolResponse(output='Tool call failed; see user message below for details.')

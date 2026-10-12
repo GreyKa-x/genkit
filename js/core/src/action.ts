@@ -534,6 +534,12 @@ export function action<
       {
         metadata: {
           name: actionName,
+          // Seed input (and init) up front so the realtime "pending" span
+          // export carries them; both are already resolved by this point.
+          // `init` is stored raw (like `input`) so the tracing layer serializes
+          // them consistently.
+          input,
+          ...(options?.init !== undefined ? { init: options.init } : {}),
         },
         labels: {
           [SPAN_TYPE_ATTR]: 'action',
@@ -547,9 +553,19 @@ export function action<
           subtype: config.actionType,
         });
         if (options?.context) {
-          setCustomMetadataAttributes({
-            context: JSON.stringify(options.context),
-          });
+          try {
+            const tracedContext: Record<string, unknown> = {
+              ...options.context,
+            };
+            if ('auth' in tracedContext) tracedContext.auth = '<redacted>';
+            if ('secrets' in tracedContext)
+              tracedContext.secrets = '<redacted>';
+            setCustomMetadataAttributes({
+              context: JSON.stringify(tracedContext),
+            });
+          } catch (e) {
+            // Safely ignore or log telemetry serialization errors to prevent crashing the action
+          }
         }
 
         traceId = span.spanContext().traceId;
@@ -558,13 +574,6 @@ export function action<
           options.onTraceStart({ traceId, spanId });
         }
         metadata.name = actionName;
-        metadata.input = input;
-        if (options?.init !== undefined) {
-          // Store `init` raw (like `input`) so it is serialized consistently by
-          // the tracing layer. Pre-stringifying here would diverge from `input`
-          // and could throw on non-serializable values, failing the whole run.
-          metadata.init = options.init;
-        }
 
         try {
           const actFn = () =>

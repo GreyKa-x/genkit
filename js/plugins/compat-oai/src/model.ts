@@ -578,6 +578,7 @@ export function toOpenAIRequestBody(
     version: modelVersion,
     tools: toolsFromConfig,
     apiKey,
+    strict,
     ...restOfConfig
   } = request.config ?? {};
 
@@ -605,6 +606,16 @@ export function toOpenAIRequestBody(
     body = { ...body, ...restOfConfig }; // passthrough for other config
   }
   const response_format = request.output?.format;
+  if (
+    strict === true &&
+    (response_format !== 'json' || !request.output?.schema)
+  ) {
+    throw new GenkitError({
+      status: 'INVALID_ARGUMENT',
+      message:
+        'OpenAI strict output requires output.format="json" and an output schema.',
+    });
+  }
   if (response_format === 'json') {
     if (request.output?.schema) {
       body.response_format = {
@@ -612,6 +623,7 @@ export function toOpenAIRequestBody(
         json_schema: {
           name: 'output',
           schema: request.output!.schema,
+          ...(strict !== undefined ? { strict } : {}),
         },
       };
     } else {
@@ -723,10 +735,10 @@ export function openAIModelRunner(
             status = 'RESOURCE_EXHAUSTED';
             break;
           case 401:
-            status = 'PERMISSION_DENIED';
+            status = 'UNAUTHENTICATED';
             break;
           case 403:
-            status = 'UNAUTHENTICATED';
+            status = 'PERMISSION_DENIED';
             break;
           case 400:
             status = 'INVALID_ARGUMENT';

@@ -1,16 +1,81 @@
-# Genkit Anthropic Plugin (Community)
+# Genkit Anthropic Plugin
 
-> **Community Plugin** — This plugin is community-maintained and is not an
-> official Google or Anthropic product. It is provided on an "as-is" basis.
+Anthropic Claude model provider for Genkit.
+
+> **Building with a coding agent? Install the Genkit Python skill first.**
 >
-> **Preview** — This plugin is in preview and may have API changes in future releases.
+> ```bash
+> npx skills add genkit-ai/skills --skill developing-genkit-python
+> ```
+>
+> It teaches your agent the current Genkit Python APIs and common gotchas.
+> Source, manual install and skills for other languages:
+> [genkit-ai/skills](https://github.com/genkit-ai/skills).
 
-This Genkit plugin provides a set of tools and utilities for working with Anthropic.
+## Installation
+
+```bash
+uv add genkit-anthropic
+```
+
+## Usage
+
+```python
+from genkit import Genkit
+from genkit_anthropic import Anthropic
+
+ai = Genkit(plugins=[Anthropic()])
+
+res = await ai.generate(
+    model=Anthropic.claude_model('claude-sonnet-4-6'),
+    prompt='Explain recursion in 10 words.',
+)
+print(res.text)
+```
+
+Set `ANTHROPIC_API_KEY` in the environment, or pass `api_key=` to `Anthropic()`.
+`base_url=` points the plugin at another server. Pass the origin with no `/v1`
+suffix; the SDK appends `/v1/messages`. Any other `AsyncAnthropic` setting goes
+in `client_options`:
+
+```python
+Anthropic(
+    api_key=key,
+    base_url='https://claude-proxy.example.com',
+    client_options={'timeout': 30, 'max_retries': 5, 'default_headers': {'X-Team': 'search'}},
+)
+```
+
+## Per-request API key
+
+To bill a call to someone else's Anthropic account, pass their key in
+`context.secrets`. It's used for that call only:
+
+```python
+res = await ai.generate(
+    model='anthropic/claude-sonnet-4-6',
+    prompt='hi',
+    context={'secrets': {'api_key': tenant_key}},
+)
+```
+
+- `apiKey` works as well as `api_key`. Other entries in `context.secrets`
+  are left alone, so a call whose secrets hold no key runs on the plugin's
+  key. A key that is blank or not a string raises `INVALID_ARGUMENT`.
+- A key in `config` or `config.extra` raises `INVALID_ARGUMENT`; config is
+  recorded in traces.
+- The plugin doesn't need a key of its own: `Anthropic()` with no
+  `ANTHROPIC_API_KEY` serves every call that brings a key in
+  `context.secrets`, and a call without one fails with `FAILED_PRECONDITION`.
+- A client whose credential can't be swapped refuses a tenant key with
+  `FAILED_PRECONDITION` rather than billing its own account: an
+  `Anthropic(client_options={'auth_token': ...})` client, one whose `default_headers` pin
+  `x-api-key` or `Authorization`, and Claude on Vertex AI Model Garden, which
+  authenticates with Google Cloud credentials.
 
 ## Disclaimer
 
-This is a **community-maintained** plugin and is not officially supported by
-Google or Anthropic. Use of Anthropic's API is subject to
+Use of Anthropic's API is subject to
 [Anthropic's Terms of Service](https://www.anthropic.com/terms) and
 [Privacy Policy](https://www.anthropic.com/privacy). You are responsible for
 complying with all applicable terms when using this plugin.

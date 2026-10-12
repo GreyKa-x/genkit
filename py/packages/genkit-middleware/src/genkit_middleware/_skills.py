@@ -26,12 +26,9 @@ from typing import Any
 import yaml
 from pydantic import BaseModel as PydanticBaseModel, Field
 
-from genkit._ai._model import Message
-from genkit._ai._tools import define_tool
-from genkit._core._model import GenerateActionOptions, ModelResponse
-from genkit._core._registry import Registry
-from genkit._core._typing import Part, Role, TextPart
+from genkit import Message, ModelResponse, Part, Role, Tool, tool
 from genkit.middleware import BaseMiddleware, GenerateHookParams, GenerateMiddlewareContext
+from genkit.model import GenerateActionOptions
 
 _SKILLS_MARKER = 'skills-instructions'
 _MISSING_DESCRIPTION = 'No description provided.'
@@ -125,14 +122,14 @@ class Skills(BaseMiddleware[SkillsConfig]):
                 break
 
         marker_meta: dict[str, Any] = {_SKILLS_MARKER: True}
-        new_part = Part(root=TextPart(text=prompt_text, metadata=marker_meta))
+        new_part = Part.from_text(prompt_text, metadata=marker_meta)
 
         if system_idx is not None:
             msg = messages[system_idx]
             new_content = []
             replaced = False
             for part in msg.content:
-                meta = part.root.metadata if isinstance(part.root, TextPart) else None
+                meta = part.metadata if part.text is not None else None
                 if isinstance(meta, dict) and meta.get(_SKILLS_MARKER):
                     new_content.append(new_part)
                     replaced = True
@@ -148,11 +145,9 @@ class Skills(BaseMiddleware[SkillsConfig]):
         new_options.messages = messages
         return new_options
 
-    def tools(self, ctx: GenerateMiddlewareContext) -> list[Any]:
+    def tools(self, ctx: GenerateMiddlewareContext) -> list[Tool]:
         if not self._scan_skills():
             return []
-
-        scratch = Registry()
 
         async def use_skill(input: _UseSkillInput) -> str:
             skill_name = input.skill_name
@@ -167,8 +162,7 @@ class Skills(BaseMiddleware[SkillsConfig]):
             except Exception as exc:
                 return f'Failed to read skill "{skill_name}": {exc}'
 
-        t = define_tool(scratch, use_skill, name='use_skill')
-        return [t.action()]
+        return [tool(use_skill, description='Load a skill by name.')]
 
     async def wrap_generate(
         self,

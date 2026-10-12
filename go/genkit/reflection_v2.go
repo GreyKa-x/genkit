@@ -31,8 +31,10 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+
 	"github.com/firebase/genkit/go/core"
 	"github.com/firebase/genkit/go/core/api"
+	"github.com/firebase/genkit/go/core/status"
 	"github.com/firebase/genkit/go/core/tracing"
 	"github.com/firebase/genkit/go/internal"
 )
@@ -86,6 +88,12 @@ type jsonRPCError struct {
 	Data    any    `json:"data,omitempty"`
 }
 
+// Error lets a jsonRPCError travel as an error while keeping Code
+// inspectable, which register needs to recognize an auth rejection.
+func (e *jsonRPCError) Error() string {
+	return fmt.Sprintf("jsonrpc error %d: %s", e.Code, e.Message)
+}
+
 // reflectionRegisterResponse is the result payload for a register request.
 // Not in the generated schema because its only field is optional and the
 // JS side reads it structurally.
@@ -129,12 +137,20 @@ type reflectionServerV2 struct {
 	// the action has finished initializing are buffered rather than dropped.
 	bidiMu       sync.Mutex
 	bidiSessions map[string]*bidiSession
+
+	// authRejected is set by readLoop when the CLI refuses this runtime's
+	// secret, which stops the session loop from reconnecting into a refusal
+	// loop.
+	authRejected atomic.Bool
 }
 
 // reflectionServerV2Options configures the V2 reflection client.
 type reflectionServerV2Options struct {
 	Name string // App name (optional, defaults to the runtime ID).
 	URL  string // WebSocket URL of the CLI manager.
+	// Secret presented in register. The CLI rejects the connection when it
+	// requires a secret and this does not match.
+	Secret string
 }
 
 // startReflectionServerV2 connects to the CLI's WebSocket server and spawns
@@ -185,7 +201,7 @@ func (s *reflectionServerV2) connect(ctx context.Context) error {
 	s.writeMu.Lock()
 	s.conn = conn
 	s.writeMu.Unlock()
-	slog.Debug("reflection V2: connected", "url", s.opts.URL)
+	slog.Info("reflection V2: connected to reflection server", "url", s.opts.URL)
 	return nil
 }
 
@@ -208,6 +224,11 @@ func (s *reflectionServerV2) session(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// The CLI refused this runtime's secret. That will not change, so
+		// reconnecting would just loop against a server that keeps refusing.
+		if s.authRejected.Load() {
+			return
+		}
 
 		delay := reconnectBaseDelay << attempt
 		if delay > reconnectMaxDelay {
@@ -222,7 +243,7 @@ func (s *reflectionServerV2) session(ctx context.Context) {
 		}
 
 		if err := s.connect(ctx); err != nil {
-			slog.Debug("reflection V2: reconnect failed", "err", err)
+			slog.Debug("reflection V2: reconnect failed", "error", err)
 			attempt++
 			continue
 		}
@@ -245,17 +266,25 @@ func (s *reflectionServerV2) register(ctx context.Context) {
 		GenkitVersion:            "go/" + internal.Version,
 		ReflectionApiSpecVersion: internal.GENKIT_REFLECTION_API_SPEC_VERSION,
 		Envs:                     []string{"dev"},
+		Secret:                   s.opts.Secret,
 	}
 
 	result, err := s.sendRequest(ctx, "register", params)
 	if err != nil {
-		slog.Error("reflection V2: register failed", "err", err)
+		// Auth failures are terminal. readLoop has already flagged it and
+		// stopped the session; this only reports it.
+		var rpcErr *jsonRPCError
+		if errors.As(err, &rpcErr) && rpcErr.Code == reflectionAuthErrorCode {
+			slog.Error("reflection API rejected this runtime; not reconnecting", "error", rpcErr.Message)
+			return
+		}
+		slog.Error("reflection V2: register failed", "error", err)
 		return
 	}
 	var resp reflectionRegisterResponse
 	if len(result) > 0 {
 		if err := json.Unmarshal(result, &resp); err != nil {
-			slog.Error("reflection V2: invalid register response", "err", err)
+			slog.Error("reflection V2: invalid register response", "error", err)
 			return
 		}
 	}
@@ -275,7 +304,7 @@ func (s *reflectionServerV2) readLoop(ctx context.Context) {
 		var msg jsonRPCMessage
 		if err := wsjson.Read(ctx, s.conn, &msg); err != nil {
 			if ctx.Err() == nil && websocket.CloseStatus(err) == -1 {
-				slog.Debug("reflection V2: read error", "err", err)
+				slog.Debug("reflection V2: read error", "error", err)
 			}
 			return
 		}
@@ -310,6 +339,16 @@ func (s *reflectionServerV2) readLoop(ctx context.Context) {
 				go s.handleRequest(ctx, &msg)
 			}
 		} else if msg.ID != "" {
+			// -32001 is the CLI rejecting this runtime's secret, which is
+			// terminal. Flag it here, on the session goroutine, before
+			// returning: the session loop checks the flag right after
+			// readLoop returns, and the register goroutine (which only logs)
+			// may not have run yet.
+			if msg.Error != nil && msg.Error.Code == reflectionAuthErrorCode {
+				s.authRejected.Store(true)
+				s.deliverResponse(&msg)
+				return
+			}
 			s.deliverResponse(&msg)
 		}
 	}
@@ -582,7 +621,7 @@ func (s *reflectionServerV2) handleRunActionBidi(ctx context.Context, req *jsonR
 				continue
 			}
 			if err := s.sendStreamChunk(req.ID, chunk); err != nil {
-				slog.Debug("reflection V2: streamChunk send failed", "err", err)
+				slog.Debug("reflection V2: streamChunk send failed", "error", err)
 				forward = false
 			}
 		}
@@ -614,7 +653,7 @@ func (s *reflectionServerV2) handleRunActionBidi(ctx context.Context, req *jsonR
 func (s *reflectionServerV2) handleSendInputStreamChunk(req *jsonRPCMessage) {
 	var params ReflectionSendInputStreamChunkParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		slog.Debug("reflection V2: invalid sendInputStreamChunk params", "err", err)
+		slog.Debug("reflection V2: invalid sendInputStreamChunk params", "error", err)
 		return
 	}
 	session := s.lookupBidiSession(params.RequestID)
@@ -631,7 +670,7 @@ func (s *reflectionServerV2) handleSendInputStreamChunk(req *jsonRPCMessage) {
 func (s *reflectionServerV2) handleEndInputStream(req *jsonRPCMessage) {
 	var params ReflectionEndInputStreamParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		slog.Debug("reflection V2: invalid endInputStream params", "err", err)
+		slog.Debug("reflection V2: invalid endInputStream params", "error", err)
 		return
 	}
 	session := s.lookupBidiSession(params.RequestID)
@@ -734,7 +773,7 @@ func (s *bidiSession) run(conn api.BidiJSONConnection) {
 			return
 		}
 		if err := conn.Send(ev.chunk); err != nil {
-			slog.Debug("reflection V2: bidi Send failed", "err", err)
+			slog.Debug("reflection V2: bidi Send failed", "error", err)
 		}
 	}
 }
@@ -792,10 +831,24 @@ func (s *bidiSession) stop() {
 // sendRunActionError maps a runAction error to a JSON-RPC error response
 // with a Status-shaped data field matching the JS implementation.
 func (s *reflectionServerV2) sendRunActionError(id string, err error, traceID string) {
-	code := core.INTERNAL
+	// The reflection API serves the Dev UI, so it reports the real message and
+	// stack. Suppressing them here would only hide the failure from the
+	// developer causing it; the redaction that matters is at the flow HTTP
+	// boundary (see clientError in servers.go).
+	e := status.Convert(err)
+	if e == nil {
+		// err was a non-nil interface holding a nil *status.Error, which
+		// Convert documents as returning nil. There is no classification or
+		// stack to mine, but the run did fail, so report it as internal.
+		e = &status.Error{Status: status.Internal, Message: err.Error()}
+	}
+	code := e.Status
 	msg := err.Error()
 	if errors.Is(err, context.Canceled) {
-		code = core.CANCELLED
+		// A cancellation anywhere in the chain wins, even when an intermediate
+		// frame reclassified the error; the Dev UI keys on CANCELLED to tell a
+		// user-initiated cancel from a failure.
+		code = status.Cancelled
 		msg = "Action was cancelled"
 	}
 
@@ -803,15 +856,16 @@ func (s *reflectionServerV2) sendRunActionError(id string, err error, traceID st
 	if traceID != "" {
 		details["traceId"] = traceID
 	}
-	var ge *core.GenkitError
-	if errors.As(err, &ge) && ge.Details != nil {
-		if stack, ok := ge.Details["stack"].(string); ok {
-			details["stack"] = stack
-		}
+	// status.Errorf records the stack out of band; core.NewError still puts
+	// one in Details for compatibility. Prefer whichever is present.
+	if stack, ok := e.Details["stack"].(string); ok {
+		details["stack"] = stack
+	} else if stack := e.Stack(); stack != "" {
+		details["stack"] = stack
 	}
 
 	data := map[string]any{
-		"code":    core.StatusNameToCode[code],
+		"code":    code.Code(),
 		"message": msg,
 	}
 	if len(details) > 0 {
@@ -825,7 +879,7 @@ func (s *reflectionServerV2) sendRunActionError(id string, err error, traceID st
 func (s *reflectionServerV2) handleConfigure(req *jsonRPCMessage) {
 	var params ReflectionConfigureParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		slog.Error("reflection V2: invalid configure params", "err", err)
+		slog.Error("reflection V2: invalid configure params", "error", err)
 		return
 	}
 	configureTelemetry(params.TelemetryServerURL)
@@ -861,7 +915,7 @@ func (s *reflectionServerV2) handleCancelAction(req *jsonRPCMessage) {
 // the read loop will detect a broken connection on its next read.
 func (s *reflectionServerV2) sendResponse(id string, result any) {
 	if err := s.send(&jsonRPCResponse{JSONRPC: "2.0", Result: result, ID: id}); err != nil {
-		slog.Error("reflection V2: failed to send response", "err", err, "id", id)
+		slog.Error("reflection V2: failed to send response", "error", err, "id", id)
 	}
 }
 
@@ -872,7 +926,7 @@ func (s *reflectionServerV2) sendErrorResponse(id string, code int, message stri
 		Error:   &jsonRPCError{Code: code, Message: message, Data: data},
 		ID:      id,
 	}); err != nil {
-		slog.Error("reflection V2: failed to send error response", "err", err, "id", id)
+		slog.Error("reflection V2: failed to send error response", "error", err, "id", id)
 	}
 }
 
@@ -904,7 +958,7 @@ func (s *reflectionServerV2) sendRequest(ctx context.Context, method string, par
 	select {
 	case resp := <-ch:
 		if resp.err != nil {
-			return nil, fmt.Errorf("jsonrpc error %d: %s", resp.err.Code, resp.err.Message)
+			return nil, resp.err
 		}
 		return resp.result, nil
 	case <-ctx.Done():

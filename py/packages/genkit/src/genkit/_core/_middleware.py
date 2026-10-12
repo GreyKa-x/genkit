@@ -18,13 +18,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Generic, NamedTuple, Protocol, TypeVar, cast, get_args, get_origin
 
-from pydantic import BaseModel, ConfigDict, PrivateAttr
+from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
 
 from genkit._core._action import Action
 from genkit._core._logger import get_logger
@@ -33,9 +34,13 @@ from genkit._core._model import (
     ModelRequest,
     ModelResponse,
     ModelResponseChunk,
+    MultipartToolResponse,
+    Part,
+    as_part,
 )
-from genkit._core._protocols import RegistryLike
-from genkit._core._typing import MiddlewareDesc, MultipartToolResponse, ToolRequestPart
+from genkit._core._protocols import GenkitLike, RegistryLike
+from genkit._core._tool import Tool
+from genkit._core._typing import MiddlewareDesc
 
 logger = get_logger(__name__)
 
@@ -118,23 +123,36 @@ class ToolHookParams(BaseModel):
 
     model_config: ClassVar[ConfigDict] = ConfigDict(arbitrary_types_allowed=True)
 
-    tool_request_part: ToolRequestPart
+    tool_request_part: Part
     tool: Action
+
+    @field_validator('tool_request_part', mode='before')
+    @classmethod
+    def _wrap_tool_request_part(cls, v: object) -> object:
+        if v is None:
+            return v
+        part = as_part(v)
+        if part.tool_request is None:
+            raise ValueError('wrap_tool needs a tool request part')
+        return part
 
 
 @dataclass
 class GenerateMiddlewareContext:
     """Per-``generate()`` runtime services shared by every middleware in ``use=[...]``.
 
-    Holds the call-scoped registry, caller-provided metadata (``custom_context``),
-    and streaming hooks for the whole generate invocation. Hook ``params`` carry
-    per-turn request data only.
+    ``ai`` is the app's ``Genkit`` instance, so ``await ctx.ai.lookup_model(name)``,
+    ``await ctx.ai.lookup_tool(name)`` and ``ctx.ai.lookup_value(kind=..., name=...)``
+    find what the app defined. Inside an agent, read the session with
+    ``genkit.exp.current_session()``. Also carries caller-provided metadata
+    (``custom_context``), streaming hooks, and the abort signal for the whole
+    generate invocation.
     """
 
-    registry: RegistryLike
+    ai: GenkitLike
+    abort_signal: asyncio.Event = field(default_factory=asyncio.Event)
     custom_context: dict[str, object] = field(default_factory=dict)
     on_chunk: Callable[[ModelResponseChunk], None] | None = None
-    abort_signal: Any | None = None
     telemetry_labels: dict[str, str] | None = None
 
     @property
@@ -247,7 +265,7 @@ class BaseMiddleware(Generic[TConfig]):
         else:
             self.config = cast(Any, self.Config(**kwargs))
 
-    def tools(self, ctx: GenerateMiddlewareContext) -> list[Action]:
+    def tools(self, ctx: GenerateMiddlewareContext) -> list[Tool]:
         """Return additional tools to expose to the model for this generate call."""
         return []
 
@@ -296,7 +314,7 @@ class MiddlewareDef(Protocol):
     against this protocol so it only calls hooks, not constructors or config.
     """
 
-    def tools(self, ctx: GenerateMiddlewareContext) -> list[Action]:
+    def tools(self, ctx: GenerateMiddlewareContext) -> list[Tool]:
         """Return additional tools to expose to the model for this generate call."""
         ...
 
@@ -386,24 +404,6 @@ def _derive_config_schema(cls: type[BaseMiddleware]) -> dict[str, Any]:
             'properties': {},
             'additionalProperties': True,
         }
-
-
-def new_middleware(
-    cls: type[BaseMiddleware],
-    name: str,
-    description: str | None = None,
-) -> GenerateMiddleware:
-    """Ergonomic helper to define a new ``GenerateMiddleware``.
-
-    Args:
-        cls: The BaseMiddleware subclass.
-        name: The registry name.
-        description: Optional human-readable description.
-
-    Returns:
-        A new GenerateMiddleware instance.
-    """
-    return GenerateMiddleware(cls=cls, name=name, description=description)
 
 
 def middleware_class_index(registry: RegistryLike) -> dict[type[BaseMiddleware], str]:

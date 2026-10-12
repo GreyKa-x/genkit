@@ -25,15 +25,25 @@ Example:
     # myapp/views.py
     from genkit import Genkit
     from genkit_django import genkit_django_handler
+    from genkit_google_genai import GoogleAI
 
-    ai = Genkit(plugins=[...])
+    # 1. Initialize Genkit
+    ai = Genkit(plugins=[GoogleAI()])
 
 
+    # 2. Define flow and decorate as Django view
     @genkit_django_handler(ai)
     @ai.flow()
     async def chat(prompt: str) -> str:
-        response = await ai.generate(prompt=prompt)
-        return response.text
+        res = await ai.generate(
+            model=GoogleAI.gemini_model('gemini-flash-latest'),
+            prompt=f'Answer concisely: {prompt}',
+        )
+        return res.text
+
+
+    # POST /chat/ {"data": "Hello!"}
+    # => {"result": "Hi there! How can I assist you today?"}
     ```
 
     ```python
@@ -59,8 +69,9 @@ Wire protocol:
     - Streaming: ``Accept: text/event-stream`` or ``?stream=true`` returns
       ``text/event-stream`` with ``data: {"message": ...}`` chunks and a
       final ``data: {"result": ...}`` event.
-    - Non-stream: ``{"result": <flow_output>}`` on success; 500 with
-      ``HttpErrorWireFormat`` JSON on exception.
+    - Non-stream: ``{"result": <flow_output>}`` on success. A ``PublicError``
+      keeps its HTTP status and message; any other ``GenkitError`` (including
+      a provider-marked failure) is 500 Internal Error.
 
 The returned view is automatically ``csrf_exempt`` because this is a JSON API.
 
@@ -69,16 +80,6 @@ See Also:
     - Genkit documentation: https://genkit.dev/
 """
 
-from .handler import genkit_django_handler
+from ._handler import genkit_django_handler
 
-
-def package_name() -> str:
-    """Get the package name for the Django plugin.
-
-    Returns:
-        The fully qualified package name as a string.
-    """
-    return 'genkit_django'
-
-
-__all__ = ['package_name', genkit_django_handler.__name__]
+__all__ = ['genkit_django_handler']

@@ -24,11 +24,14 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/firebase/genkit/go/ai"
+	aix "github.com/firebase/genkit/go/ai/exp"
 	"github.com/firebase/genkit/go/core"
 	"github.com/firebase/genkit/go/core/api"
 	"github.com/firebase/genkit/go/core/tracing"
@@ -218,13 +221,75 @@ func TestReflectionServerV2_RegisterHandshakeTelemetry(t *testing.T) {
 	// path to make sure it doesn't panic or stall.
 }
 
+// startRuntimeWithSecret is startRuntime with a reflection secret configured.
+func startRuntimeWithSecret(t *testing.T, g *Genkit, m *fakeManager, secret string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	errCh := make(chan error, 1)
+	startedCh := make(chan struct{})
+	go startReflectionServerV2(ctx, g, reflectionServerV2Options{URL: m.url, Secret: secret}, errCh, startedCh)
+	select {
+	case err := <-errCh:
+		t.Fatalf("runtime failed to start: %v", err)
+	case <-startedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for runtime startup")
+	}
+}
+
+func TestReflectionServerV2_RegisterSendsSecret(t *testing.T) {
+	m := newFakeManager(t)
+	defer m.close()
+
+	g := Init(context.Background())
+	startRuntimeWithSecret(t, g, m, "s3cret")
+
+	conn := m.waitForConnection(t)
+	msg := m.ackRegister(t, context.Background(), conn)
+	params := msg["params"].(map[string]any)
+	if params["secret"] != "s3cret" {
+		t.Errorf("register secret = %v, want s3cret", params["secret"])
+	}
+}
+
+func TestReflectionServerV2_AuthRejectionStopsReconnecting(t *testing.T) {
+	m := newFakeManager(t)
+	defer m.close()
+
+	g := Init(context.Background())
+	startRuntimeWithSecret(t, g, m, "wrong")
+
+	// Reject the way the CLI does (closeUnregistered in manager-v2.ts): a
+	// -32001 error immediately followed by a 1008 close.
+	conn := m.waitForConnection(t)
+	ctx := context.Background()
+	msg := m.read(t, ctx, conn)
+	if msg["method"] != "register" {
+		t.Fatalf("expected register, got method=%v", msg["method"])
+	}
+	m.write(t, ctx, conn, map[string]any{
+		"jsonrpc": "2.0",
+		"error":   map[string]any{"code": reflectionAuthErrorCode, "message": "Invalid reflection secret."},
+		"id":      msg["id"],
+	})
+	conn.Close(websocket.StatusPolicyViolation, "unauthorized")
+
+	// A reconnect would arrive after reconnectBaseDelay; wait a few of them.
+	select {
+	case <-m.connCh:
+		t.Fatal("runtime reconnected after an auth rejection")
+	case <-time.After(3 * reconnectBaseDelay):
+	}
+}
+
 func TestReflectionServerV2_ListActions(t *testing.T) {
 	m := newFakeManager(t)
 	defer m.close()
 
 	g := Init(context.Background())
-	core.DefineAction(g.reg, "test/inc", api.ActionTypeCustom, nil, nil, inc)
-	core.DefineAction(g.reg, "test/dec", api.ActionTypeCustom, nil, nil, dec)
+	defineTestAction(g.reg, "test/inc", api.ActionTypeCustom, nil, nil, inc)
+	defineTestAction(g.reg, "test/dec", api.ActionTypeCustom, nil, nil, dec)
 
 	ctx, cancel := startRuntime(t, g, m)
 	defer cancel()
@@ -327,7 +392,7 @@ func TestReflectionServerV2_RunAction(t *testing.T) {
 	defer m.close()
 
 	g := Init(context.Background())
-	core.DefineAction(g.reg, "test/inc", api.ActionTypeCustom, nil, nil, inc)
+	defineTestAction(g.reg, "test/inc", api.ActionTypeCustom, nil, nil, inc)
 
 	ctx, cancel := startRuntime(t, g, m)
 	defer cancel()
@@ -452,7 +517,7 @@ func TestReflectionServerV2_StreamingRunAction(t *testing.T) {
 		}
 		return x, nil
 	}
-	core.DefineStreamingAction(g.reg, "test/streaming", api.ActionTypeCustom, nil, nil, streamInc)
+	defineTestStreamingAction(g.reg, "test/streaming", api.ActionTypeCustom, nil, nil, streamInc)
 
 	ctx, cancel := startRuntime(t, g, m)
 	defer cancel()
@@ -547,7 +612,7 @@ func TestReflectionServerV2_CancelAction(t *testing.T) {
 
 	g := Init(context.Background())
 	started := make(chan struct{})
-	core.DefineAction(g.reg, "test/slow", api.ActionTypeCustom, nil, nil,
+	defineTestAction(g.reg, "test/slow", api.ActionTypeCustom, nil, nil,
 		func(ctx context.Context, _ any) (any, error) {
 			close(started)
 			<-ctx.Done()
@@ -616,7 +681,7 @@ func TestReflectionServerV2_BidiRunAction(t *testing.T) {
 		Prefix string `json:"prefix"`
 	}
 
-	core.DefineBidiAction(g.reg, "test/bidi-echo", api.ActionTypeCustom, nil,
+	defineTestBidiAction(g.reg, api.ActionTypeCustom, "test/bidi-echo", nil,
 		func(ctx context.Context, cfg initConfig, inCh <-chan string, outCh chan<- string) (string, error) {
 			var n int
 			for chunk := range inCh {
@@ -707,6 +772,88 @@ loop:
 	}
 }
 
+func TestReflectionServerV2_PromptAgentRejectsEmptyStreamInput(t *testing.T) {
+	m := newFakeManager(t)
+	defer m.close()
+
+	g := Init(context.Background())
+	var modelCalls atomic.Int64
+	DefineModel(g, "test/agent-empty-guard", &ai.ModelOptions{Supports: &ai.ModelSupports{Multiturn: true}},
+		func(ctx context.Context, req *ai.ModelRequest, cb ai.ModelStreamCallback) (*ai.ModelResponse, error) {
+			modelCalls.Add(1)
+			return &ai.ModelResponse{Message: ai.NewModelTextMessage("unexpected")}, nil
+		},
+	)
+	aix.DefineAgent[any](g.reg, "promptAgent", aix.InlinePrompt{ai.WithModelName("test/agent-empty-guard")})
+
+	ctx, cancel := startRuntime(t, g, m)
+	defer cancel()
+
+	conn := m.waitForConnection(t)
+	m.ackRegister(t, ctx, conn)
+
+	m.write(t, ctx, conn, map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "runAction",
+		"params": map[string]any{
+			"key":         "/agent/promptAgent",
+			"streamInput": true,
+		},
+		"id": "agent-empty-1",
+	})
+	m.write(t, ctx, conn, map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "sendInputStreamChunk",
+		"params":  map[string]any{"requestId": "agent-empty-1", "chunk": map[string]any{}},
+	})
+	m.write(t, ctx, conn, map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "endInputStream",
+		"params":  map[string]any{"requestId": "agent-empty-1"},
+	})
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for response")
+		default:
+		}
+		msg := m.read(t, ctx, conn)
+		if msg["method"] == "runActionState" {
+			continue // ignore notifications (e.g., runActionState)
+		}
+		if errObj, ok := msg["error"].(map[string]any); ok {
+			t.Fatalf("expected failed agent output, got error: %v", errObj)
+		}
+		result, ok := msg["result"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected result object, got %v", msg)
+		}
+		output, ok := result["result"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected agent output object, got %v", result["result"])
+		}
+		if output["finishReason"] != "failed" {
+			t.Errorf("finishReason = %v, want failed", output["finishReason"])
+		}
+		errObj, ok := output["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected agent output error, got %v", output["error"])
+		}
+		if errObj["status"] != string(core.INVALID_ARGUMENT) {
+			t.Errorf("error status = %v, want %s", errObj["status"], core.INVALID_ARGUMENT)
+		}
+		if !strings.Contains(errObj["message"].(string), "message") {
+			t.Errorf("error message = %q, want substring %q", errObj["message"], "message")
+		}
+		if got := modelCalls.Load(); got != 0 {
+			t.Fatalf("model calls = %d, want 0", got)
+		}
+		return
+	}
+}
+
 func toJSON(t *testing.T, v any) string {
 	t.Helper()
 	b, err := json.Marshal(v)
@@ -730,7 +877,7 @@ func TestReflectionServerV2_BidiRunActionDropsAfterEnd(t *testing.T) {
 	var seenMu sync.Mutex
 	var seen []string
 
-	core.DefineBidiAction(g.reg, "test/bidi-record", api.ActionTypeCustom, nil,
+	defineTestBidiAction(g.reg, api.ActionTypeCustom, "test/bidi-record", nil,
 		func(ctx context.Context, _ struct{}, inCh <-chan string, outCh chan<- string) (string, error) {
 			for chunk := range inCh {
 				seenMu.Lock()
@@ -814,7 +961,7 @@ func TestReflectionServerV2_BidiRunActionErrors(t *testing.T) {
 
 	g := Init(context.Background())
 
-	core.DefineBidiAction(g.reg, "test/bidi-fail", api.ActionTypeCustom, nil,
+	defineTestBidiAction(g.reg, api.ActionTypeCustom, "test/bidi-fail", nil,
 		func(ctx context.Context, _ struct{}, inCh <-chan string, outCh chan<- string) (string, error) {
 			for range inCh {
 			}
@@ -873,7 +1020,7 @@ func TestReflectionServerV2_BidiInvalidChunkFailsRun(t *testing.T) {
 
 	g := Init(context.Background())
 
-	core.DefineBidiAction(g.reg, "test/bidi-strict", api.ActionTypeCustom, nil,
+	defineTestBidiAction(g.reg, api.ActionTypeCustom, "test/bidi-strict", nil,
 		func(ctx context.Context, _ struct{}, inCh <-chan string, outCh chan<- string) (string, error) {
 			for {
 				select {
@@ -1006,7 +1153,7 @@ func TestReflectionServerV2_BidiRunActionNoStream(t *testing.T) {
 
 	g := Init(context.Background())
 
-	core.DefineBidiAction(g.reg, "test/bidi-quiet", api.ActionTypeCustom, nil,
+	defineTestBidiAction(g.reg, api.ActionTypeCustom, "test/bidi-quiet", nil,
 		func(ctx context.Context, _ struct{}, inCh <-chan string, outCh chan<- string) (string, error) {
 			var last string
 			for chunk := range inCh {
@@ -1086,7 +1233,7 @@ func TestReflectionServerV2_BidiInputClosedOnDisconnect(t *testing.T) {
 	g := Init(context.Background())
 
 	inputEnded := make(chan struct{})
-	core.DefineBidiAction(g.reg, "test/bidi-hang", api.ActionTypeCustom, nil,
+	defineTestBidiAction(g.reg, api.ActionTypeCustom, "test/bidi-hang", nil,
 		func(ctx context.Context, _ struct{}, inCh <-chan string, outCh chan<- string) (string, error) {
 			for range inCh {
 			}
