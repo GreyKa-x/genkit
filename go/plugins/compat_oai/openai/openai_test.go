@@ -18,6 +18,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,82 @@ import (
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/shared"
 )
+
+// Exercise the public model boundary and inspect the actual HTTP request: the
+// SDK field must survive both schema validation and typed config conversion.
+func TestPromptCacheKeyReachesProvider(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, typed := range []bool{false, true} {
+			name := "map"
+			if typed {
+				name = "typed"
+			}
+			if stream {
+				name += "_stream"
+			}
+			t.Run(name, func(t *testing.T) {
+				var received map[string]any
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					received = nil
+					if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+						t.Error(err)
+					}
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "data: {\"id\":\"test\",\"object\":\"chat.completion.chunk\",\"model\":\"agent-advoo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ACK\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"test\",\"object\":\"chat.completion.chunk\",\"model\":\"agent-advoo\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+					} else {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = io.WriteString(w, `{"id":"test","object":"chat.completion","model":"agent-advoo","choices":[{"index":0,"message":{"role":"assistant","content":"ACK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+					}
+				}))
+				defer server.Close()
+				g := genkit.Init(context.Background(), genkit.WithPlugins(&OpenAI{APIKey: "test", Opts: []option.RequestOption{option.WithBaseURL(server.URL), option.WithMaxRetries(0)}}))
+				var config any = map[string]any{"prompt_cache_key": "advoo:synthetic", "temperature": 0.5}
+				if typed {
+					config = &openaiGo.ChatCompletionNewParams{PromptCacheKey: openaiGo.String("advoo:synthetic"), Temperature: openaiGo.Float(0.5)}
+				}
+				opts := []ai.GenerateOption{ai.WithModelName("openai/agent-advoo"), ai.WithPrompt("ACK"), ai.WithConfig(config)}
+				if stream {
+					opts = append(opts, ai.WithStreaming(func(context.Context, *ai.ModelResponseChunk) error { return nil }))
+				}
+				resp, err := genkit.Generate(context.Background(), g, opts...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if resp.Text() != "ACK" {
+					t.Fatalf("response = %q", resp.Text())
+				}
+				if received["prompt_cache_key"] != "advoo:synthetic" || received["temperature"] != 0.5 {
+					t.Fatalf("cache key or existing parameter lost: %v", received)
+				}
+				if stream && received["stream"] != true {
+					t.Fatal("streaming request not used")
+				}
+				// Existing requests without the new field still work.
+				legacyOpts := []ai.GenerateOption{ai.WithModelName("openai/agent-advoo"), ai.WithPrompt("ACK"), ai.WithConfig(map[string]any{"temperature": 0.5})}
+				if stream {
+					legacyOpts = append(legacyOpts, ai.WithStreaming(func(context.Context, *ai.ModelResponseChunk) error { return nil }))
+				}
+				if _, err := genkit.Generate(context.Background(), g, legacyOpts...); err != nil {
+					t.Fatal(err)
+				}
+				if _, present := received["prompt_cache_key"]; present {
+					t.Fatal("cache key leaked into request without a key")
+				}
+			})
+		}
+	}
+}
+
+func TestPromptCacheKeyConfigValidation(t *testing.T) {
+	_, g := initPlugin(t)
+	for _, config := range []map[string]any{{"prompt_cache_key": 123}, {"unknown_cache_field": "key"}} {
+		_, err := genkit.Generate(context.Background(), g, ai.WithModelName("openai/agent-advoo"), ai.WithPrompt("ACK"), ai.WithConfig(config))
+		if err == nil || !strings.Contains(err.Error(), "did not match expected schema") {
+			t.Fatalf("invalid config was not rejected by schema: %v", err)
+		}
+	}
+}
 
 func initPlugin(t *testing.T) (*OpenAI, *genkit.Genkit) {
 	t.Helper()
